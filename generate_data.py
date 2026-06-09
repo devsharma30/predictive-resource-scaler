@@ -87,41 +87,27 @@ def generate_server_data(days: int = 90) -> pd.DataFrame:
 
         # Add the spike magnitude to every minute in the spike window
         spikes[idx:end] += magnitude
-        # Note: [idx:end] is array slicing — modifies a range at once
 
-    # ── STEP 9: Combine everything ────────────────────────────────────────────
+    # Now we have to combine everything to get the final CPU usage for each minute :->
     cpu_usage = base_cpu + noise + spikes
 
-    # KEY CONCEPT — np.clip:
-    #   Clamps every value in an array to stay within [min, max].
-    #   CPU can't be negative or over 100%, so we clip.
-    #   Without clip: noise could push CPU to -3% or 107% which is nonsensical.
+    # CPU usage can't be negative or above 100%, so we clip it to that range.
     cpu_usage = np.clip(cpu_usage, 5, 100)
 
-    # ── STEP 10: Generate correlated metrics ──────────────────────────────────
     # Request count correlates with CPU: more requests = more CPU used.
     # We model it as: requests = cpu × 50 + noise
-    # .astype(int) converts floats to integers (can't have 0.7 requests)
     request_count = (cpu_usage * 50) + np.random.normal(0, 200, total_minutes)
     request_count = np.clip(request_count, 0, None).astype(int)
-    # None as max = no upper bound
 
-    # Memory usage loosely follows CPU but with its own noise
+ # Memory usage loosely follows CPU but with its own noise
     memory_usage = 30 + (cpu_usage * 0.4) + \
         np.random.normal(0, 3, total_minutes)
     memory_usage = np.clip(memory_usage, 10, 95)
 
-    # ── STEP 11: Build the DataFrame ──────────────────────────────────────────
-    # KEY CONCEPT — pd.DataFrame from a dict:
-    #   pd.DataFrame({
-    #       'col_name': array_of_values,
-    #       ...
-    #   })
-    #   Keys become column names. Values become column data.
-    #   All arrays must have the same length.
+    # Now at last let us build the DataFrame
     df = pd.DataFrame({
         'timestamp': timestamps,
-        # .round(2) = keep 2 decimal places
+        # .round(2) -> keep 2 decimal places
         'cpu_usage': cpu_usage.round(2),
         'request_count': request_count,
         'memory_usage': memory_usage.round(2)
