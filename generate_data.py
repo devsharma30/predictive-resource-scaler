@@ -32,48 +32,24 @@ def generate_server_data(days: int = 90) -> pd.DataFrame:
 
     total_minutes = days * 24 * 60
 
-    # ── STEP 2: Create timestamps ─────────────────────────────────────────────
-    # KEY CONCEPT — pd.date_range:
-    #   Generates a sequence of evenly-spaced datetime values.
-    #   start   = first timestamp
-    #   periods = how many timestamps to generate
-    #   freq    = spacing between timestamps ('min' = 1 minute)
-    #
-    #   Example output:
-    #   2024-01-01 00:00:00
-    #   2024-01-01 00:01:00
-    #   2024-01-01 00:02:00
-    #   ...
     timestamps = pd.date_range(
         start='2024-01-01',
         periods=total_minutes,
-        freq='min'            # 'min' = 1 minute  ('h'=hourly, 'd'=daily)
+        freq='min'            # 'min' = 1 minute [gap between timestamps]
     )
 
-    # ── STEP 3: Extract hour and day from each timestamp ──────────────────────
-    # .hour gives the hour component (0–23) for every timestamp in the array.
-    # .dayofweek gives day number: 0=Monday, 1=Tuesday ... 6=Sunday
-    #
-    # These are NumPy-style arrays. We use them to build our CPU pattern.
     hour_of_day = timestamps.hour         # array of 129,600 values, each 0–23
     day_of_week = timestamps.dayofweek    # array of 129,600 values, each 0–6
 
-    # ── STEP 4: Build the daily traffic pattern using a SINE WAVE ─────────────
-    # KEY CONCEPT — Why a sine wave?
+    # Why a sine wave?
     #   A sine wave (np.sin) oscillates smoothly between -1 and +1.
     #   Real CPU usage rises and falls smoothly throughout the day —
     #   that's also a wave. Sine is the natural mathematical model for it.
-    #
-    #   np.sin(2π × hour / 24) completes exactly ONE full wave per day:
-    #   - hour 0  (midnight):  sin(0)   =  0.0   → baseline
-    #   - hour 6  (6 AM):      sin(π/2) =  1.0   → peak
-    #   - hour 12 (noon):      sin(π)   =  0.0   → back to baseline
-    #   - hour 18 (6 PM):      sin(3π/2)= -1.0   → trough
-    #
-    #   But we want the PEAK at ~2 PM, not 6 AM.
-    #   Shifting by -6: (hour - 6) / 24 × 2π moves the peak to 2 PM.
-    #
-    #   np.pi is the mathematical constant π = 3.14159...
+
+    #   np.sin(2π × hour / 24) completes exactly ONE full wave per day.
+
+    #   for our purpose not necessary, but we want the PEAK at ~2 PM
+    #   Shifting by -6: (hour - 6) / 24 × 2π moves the peak to 2 PM.(as old peak if not shifted was at 6am)
     daily_wave = np.sin(2 * np.pi * (hour_of_day - 6) / 24)
 
     # ── STEP 5: Build the weekly pattern ──────────────────────────────────────
