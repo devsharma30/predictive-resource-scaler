@@ -41,7 +41,7 @@ def generate_server_data(days: int = 90) -> pd.DataFrame:
     hour_of_day = timestamps.hour         # array of 129,600 values, each 0–23
     day_of_week = timestamps.dayofweek    # array of 129,600 values, each 0–6
 
-    # Why a sine wave?
+    # Why a sine wave?(same type of explanatoion for cosine wave)
     #   A sine wave (np.sin) oscillates smoothly between -1 and +1.
     #   Real CPU usage rises and falls smoothly throughout the day —
     #   that's also a wave. Sine is the natural mathematical model for it.
@@ -52,46 +52,23 @@ def generate_server_data(days: int = 90) -> pd.DataFrame:
     #   Shifting by -6: (hour - 6) / 24 × 2π moves the peak to 2 PM.(as old peak if not shifted was at 6am)
     daily_wave = np.sin(2 * np.pi * (hour_of_day - 6) / 24)
 
-    # ── STEP 5: Build the weekly pattern ──────────────────────────────────────
+    # To Build the weekly pattern
     # Weekday traffic > weekend traffic for most business applications.
-    # We use a cosine wave across 7 days:
-    #   day 0 (Monday)  → cos(0)      =  1.0  → highest traffic
-    #   day 3 (Thursday)→ cos(π/2)    =  0.0  → mid week
-    #   day 6 (Sunday)  → cos(6π/7)   ≈ -0.9  → lowest traffic
+    # We use a cosine wave across 7 days
     weekly_wave = np.cos(2 * np.pi * day_of_week / 7) * 0.15
 
-    # ── STEP 6: Combine waves into a base CPU value ────────────────────────────
-    # Start at 45% average CPU, add daily and weekly waves.
-    # daily_wave * 25 means the wave contributes ±25% CPU swing.
+    # These values — 45% base, ±25% daily swing, ±10% weekly swing — are reasonable approximations for a general web application. not in real world .
     base_cpu = 45 + (daily_wave * 25) + (weekly_wave * 10)
 
-    # ── STEP 7: Add random noise ───────────────────────────────────────────────
-    # KEY CONCEPT — Normal (Gaussian) distribution:
-    #   Real systems never run perfectly smooth. There's always minute-to-minute
-    #   variation: a GC pause, a batch job, a slow query.
-    #
-    #   np.random.normal(mean, std_dev, size) generates random numbers
-    #   shaped like a bell curve:
-    #   - 68% of values fall within ±1 std_dev of the mean
-    #   - 95% fall within ±2 std_devs
-    #
-    #   normal(0, 5, n) → most noise is within ±5%, rarely reaches ±10%
+    #   to add random noise:->
+    #   np.random.normal(mean, std_dev, size) generates random numbers.
     noise = np.random.normal(0, 5, total_minutes)
 
-    # ── STEP 8: Inject sudden traffic spikes ──────────────────────────────────
-    # KEY CONCEPT — Why inject spikes?
-    #   In production, CPUs spike suddenly when:
-    #   - A viral post sends millions of users to your app
-    #   - A scheduled batch job fires
-    #   - A DDoS attack hits
-    #
+    # To inject sudden traffic spikes
     #   These can't be captured by a smooth wave. We inject them manually.
-    #
     # np.zeros creates an array of all 0.0 values (no spike at any minute yet)
     spikes = np.zeros(total_minutes)
 
-    # np.random.choice picks random indices without replacement.
-    # size=int(total * 0.02) means we pick 2% of all minutes as spike starts.
     spike_starts = np.random.choice(
         total_minutes,
         size=int(total_minutes * 0.02),
@@ -99,12 +76,10 @@ def generate_server_data(days: int = 90) -> pd.DataFrame:
     )
 
     for idx in spike_starts:
-        # Each spike lasts between 5 and 15 minutes
-        # np.random.randint(low, high) → random integer in [low, high)
+        # Each spike lasts between 5 and 15 minutes(picking random integer between 5 and 15)
         duration = np.random.randint(5, 15)
 
-        # Each spike adds between +20% and +40% CPU
-        # np.random.uniform(low, high) → random float in [low, high]
+        # Each spike adds between +20% and +40% CPU usage (picking random float between 20 and 40)
         magnitude = np.random.uniform(20, 40)
 
         # min(...) prevents the spike from going past the end of our array
