@@ -190,8 +190,6 @@ if __name__ == "__main__":
 
     df.to_csv("data/server_logs.csv", index=False)
 
-    # :,  inside an f-string formats a number with comma separators
-    # e.g. 129600 → "129,600"
     print(f"✅ Generated {len(df):,} rows of server data")
     print(f"   Date range : {df['timestamp'].min()} → {df['timestamp'].max()}")
     print(f"   CPU min    : {df['cpu_usage'].min():.1f}%")
