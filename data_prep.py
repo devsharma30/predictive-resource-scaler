@@ -321,3 +321,25 @@ def time_based_split(X, y_class, y_reg, test_ratio: float = 0.2):
 
     print(f"   Train: {len(X_train):,} rows  |  Test: {len(X_test):,} rows")
     return X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    df = load_data()
+    df = check_data_quality(df)
+    df = add_time_features(df)
+    df = add_lag_features(df)
+    df = add_rolling_features(df)
+    df = create_target_variable(df)
+    df = clean_data(df)
+
+    X, y_class, y_reg, df = prepare_features_labels(df)
+    X_train, X_test, yct, yc_test, yrt, yr_test = time_based_split(
+        X, y_class, y_reg)
+
+    os.makedirs("data", exist_ok=True)
+    df.to_csv("data/processed_logs.csv", index=False)
+
+    print(f"\n✅ Processed data saved → data/processed_logs.csv")
+    print(f"\nNext step: python train_models.py")
