@@ -232,3 +232,92 @@ def create_target_variable(df: pd.DataFrame,
     print(
         f"   📊 {spike_pct:.1f}% of minutes have a spike in the next {predict_ahead} min")
     return df
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drops rows that have NaN values introduced by lag/shift operations.
+
+    WHY ARE THERE NaNs?
+        - cpu_lag_30: the first 30 rows have no "30 minutes ago" data
+        - spike_in_5min: the last 5 rows have no "5 minutes in the future" data
+        → These rows have NaN in at least one column.
+
+    Most ML models crash on NaN inputs. .dropna() removes every row
+    that has ANY NaN value in ANY column.
+
+    WHY NOT fill NaNs instead of dropping?
+        Filling lag features with fake values (like 0 or the column mean)
+        would corrupt the temporal signal. Dropping is safer here
+        because we lose only ~35 rows out of 129,600 — negligible.
+    """
+    print(f"\n🧹 Cleaning: dropping NaN rows...")
+    before = len(df)
+    df = df.dropna()
+    after = len(df)
+    print(
+        f"   Rows before: {before:,}  →  after: {after:,}  (removed {before - after})")
+    return df
+
+
+def prepare_features_labels(df: pd.DataFrame):
+    """
+    Separates the DataFrame into:
+        X        → feature matrix  (inputs to the model)
+        y_class  → classification target  (0 or 1: will there be a spike?)
+        y_reg    → regression target      (exact future CPU value)
+
+    COLUMNS EXCLUDED FROM X:
+        - timestamp     : a string/datetime — not a useful number for the model
+        - future_cpu_5min : this IS what we're predicting → including it as
+                            a feature would be "cheating" (data leakage)
+        - spike_in_5min   : same — it's our target label, not an input
+        - time_of_day     : categorical string ('morning', 'evening') —
+                            needs extra encoding we skip for simplicity
+    """
+    print(f"\n📦 Preparing feature matrix X and label vector y...")
+
+    feature_cols = [
+        'hour', 'minute', 'day_of_week', 'day_of_month', 'month', 'is_weekend',
+        'cpu_usage',
+        'cpu_lag_1', 'cpu_lag_5', 'cpu_lag_10', 'cpu_lag_30',
+        'req_lag_1', 'req_lag_5',
+        'cpu_rolling_mean_5', 'cpu_rolling_mean_15', 'cpu_rolling_mean_30',
+        'cpu_rolling_std_5', 'cpu_rolling_std_15',
+        'cpu_rolling_max_15',
+        'request_count', 'memory_usage'
+    ]
+
+    X = df[feature_cols]
+    y_class = df['spike_in_5min']
+    y_reg = df['future_cpu_5min']
+
+    # .shape returns (rows, columns) as a tuple
+    print(
+        f"   X shape: {X.shape}  ({X.shape[1]} features × {X.shape[0]:,} samples)")
+    return X, y_class, y_reg, df
+
+
+def time_based_split(X, y_class, y_reg, test_ratio: float = 0.2):
+    """
+    Splits data into training and test sets CHRONOLOGICALLY.
+
+        The model only sees past data. Just like in real life.
+        If we shuffled the data randomly, the model could see "future" rows
+        during training, which would be unrealistic and lead to overfitting.
+    """
+    print(
+        f"\n✂️  Time-based split: {int((1-test_ratio)*100)}% train / {int(test_ratio*100)}% test...")
+
+    n = len(X)
+    split_point = int(n * (1 - test_ratio))    # e.g. 129565 × 0.8 = 103,652
+
+    X_train = X.iloc[:split_point]
+    X_test = X.iloc[split_point:]
+    y_class_train = y_class.iloc[:split_point]
+    y_class_test = y_class.iloc[split_point:]
+    y_reg_train = y_reg.iloc[:split_point]
+    y_reg_test = y_reg.iloc[split_point:]
+
+    print(f"   Train: {len(X_train):,} rows  |  Test: {len(X_test):,} rows")
+    return X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
