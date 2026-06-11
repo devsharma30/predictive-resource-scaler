@@ -345,15 +345,9 @@ def evaluate_classifier(model, X_test, y_test) -> dict:
         A single number that balances both.
         Useful when you want one number that summarises the classifier quality.
     """
-    # predict_proba returns an array of shape (n_samples, 2):
-    #   column 0 = probability of class 0 (no spike)
-    #   column 1 = probability of class 1 (spike)
-    # [:, 1] selects ALL rows, column 1  →  spike probability for every sample
+
     probs = model.predict_proba(X_test)[:, 1]
 
-    # Apply our tuned threshold to get binary predictions
-    # probs >= 0.78  →  boolean array True/False
-    # .astype(int)   →  converts to 1/0
     y_pred = (probs >= DECISION_THRESHOLD).astype(int)
 
     precision = precision_score(y_test, y_pred, zero_division=0)
@@ -386,3 +380,131 @@ def evaluate_classifier(model, X_test, y_test) -> dict:
         'predictions': y_pred,
         'probabilities': probs
     }
+
+
+def save_models(models: dict, scaler, results: dict):
+    """
+    Persists trained models and the scaler to disk using pickle.
+
+    KEY CONCEPT — Why save models?
+        Training takes ~30 seconds. simulate.py and visualize.py
+        need the trained models too. Without saving, we'd retrain
+        every time we run those files — wasteful.
+
+        pickle.dump(object, file):
+            Serialises (converts) any Python object into bytes.
+            Writes those bytes to a binary file.
+
+        pickle.load(file):
+            Reads the bytes back.
+            Reconstructs the exact Python object.
+            The loaded model can immediately call .predict() — no retraining.
+
+    """
+    os.makedirs("models", exist_ok=True)
+
+    for name, model in models.items():
+        path = f"models/{name}.pkl"
+        with open(path, "wb") as f:
+            pickle.dump(model, f)
+        print(f"   💾 Saved: {path}")
+
+    # Save the scaler too — needed to preprocess live data in production
+    with open("models/scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+
+    safe_results = {}
+    for key, val in results.items():
+        if isinstance(val, dict):       # isinstance checks the type of an object
+            safe_results[key] = {
+                k: (v.tolist() if hasattr(v, 'tolist') else v)
+                # hasattr checks if an object has an attribute
+                # numpy arrays have .tolist(), plain Python floats don't
+                for k, v in val.items()
+                # skip large arrays
+                if k not in ['predictions', 'probabilities']
+            }
+    with open("models/results.json", "w") as f:
+        json.dump(safe_results, f, indent=2)
+    print("   💾 Saved: models/results.json")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 60)
+    print("PREDICTIVE RESOURCE SCALER — MODEL TRAINING")
+    print("=" * 60)
+
+    # ── 1. Prepare data (reuses all functions from data_prep.py) ──────────────
+    df = load_data()
+    df = add_time_features(df)
+    df = add_lag_features(df)
+    df = add_rolling_features(df)
+    df = create_target_variable(
+        df, threshold=SPIKE_THRESHOLD, predict_ahead=PREDICT_AHEAD)
+    df = clean_data(df)
+    X, y_class, y_reg, df = prepare_features_labels(df)
+    # save column names before arrays lose them
+    feature_names = list(X.columns)
+
+    X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test = \
+        time_based_split(X, y_class, y_reg)
+
+    # ── 2. Scale features for Linear Regression ───────────────────────────────
+    X_train_sc, X_test_sc, scaler = scale_features(X_train, X_test)
+
+    # ── 3. Train all three models ─────────────────────────────────────────────
+    # Linear Regression gets SCALED data
+    lr_reg = train_linear_regression(X_train_sc, y_reg_train)
+    # Random Forest gets ORIGINAL (unscaled) data — it doesn't need scaling
+    rf_reg = train_random_forest_regressor(X_train, y_reg_train)
+    rf_clf = train_random_forest_classifier(X_train, y_class_train)
+
+    # ── 4. Evaluate ───────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("EVALUATION RESULTS")
+    print("=" * 60)
+    lr_res = evaluate_regressor(
+        lr_reg,  X_test_sc, y_reg_test,   "Linear Regression")
+    rf_res = evaluate_regressor(
+        rf_reg,  X_test,    y_reg_test,   "Random Forest")
+    clf_res = evaluate_classifier(rf_clf, X_test,    y_class_test)
+
+    # ── 5. Feature importance ─────────────────────────────────────────────────
+    imp_df = show_feature_importance(rf_reg, feature_names)
+    os.makedirs("models", exist_ok=True)
+    imp_df.to_csv("models/feature_importance.csv", index=False)
+
+    # ── 6. Print final comparison table ──────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("FINAL MODEL COMPARISON")
+    print("=" * 60)
+    print(f"\n{'Model':<25} {'MAE':>8} {'RMSE':>8} {'R²':>8}")
+    print("-" * 52)
+    print(
+        f"{'Linear Regression':<25} {lr_res['mae']:>7.2f}% {lr_res['rmse']:>7.2f}% {lr_res['r2']:>8.4f}")
+    print(
+        f"{'Random Forest':<25} {rf_res['mae']:>7.2f}% {rf_res['rmse']:>7.2f}% {rf_res['r2']:>8.4f}")
+    print(
+        f"\n  RF Classifier Precision : {clf_res['precision']*100:.1f}%  ← CV bullet metric")
+
+    # ── 7. Save everything ───────────────────────────────────────────────────
+    print("\n💾 Saving models...")
+    save_models(
+        {'lr_regressor': lr_reg, 'rf_regressor': rf_reg, 'rf_classifier': rf_clf},
+        scaler,
+        {'lr_reg': lr_res, 'rf_reg': rf_res, 'rf_clf': clf_res}
+    )
+
+    # Attach model predictions to the test rows and save for simulate.py
+    test_df = df.iloc[-len(X_test):].copy()
+    # .copy() creates a true independent copy — without it, pandas warns
+    # about modifying a "slice" of the original DataFrame
+    test_df['lr_predicted_cpu'] = lr_reg.predict(X_test_sc)
+    test_df['rf_predicted_cpu'] = rf_reg.predict(X_test)
+    test_df['rf_spike_predicted'] = clf_res['predictions']
+    test_df['rf_spike_prob'] = clf_res['probabilities']
+    test_df.to_csv("data/test_with_predictions.csv", index=False)
+    print("   💾 Saved: data/test_with_predictions.csv")
+
+    print("\n✅ All done. Next step: python simulate.py")
