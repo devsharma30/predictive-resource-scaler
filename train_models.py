@@ -444,7 +444,7 @@ if __name__ == "__main__":
         df, threshold=SPIKE_THRESHOLD, predict_ahead=PREDICT_AHEAD)
     df = clean_data(df)
     X, y_class, y_reg, df = prepare_features_labels(df)
-    # save column names before arrays lose them
+
     feature_names = list(X.columns)
 
     X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test = \
@@ -456,7 +456,7 @@ if __name__ == "__main__":
     # ── 3. Train all three models ─────────────────────────────────────────────
     # Linear Regression gets SCALED data
     lr_reg = train_linear_regression(X_train_sc, y_reg_train)
-    # Random Forest gets ORIGINAL (unscaled) data — it doesn't need scaling
+    # Random Forest gets ORIGINAL (unscaled) data as it does not need  scaling
     rf_reg = train_random_forest_regressor(X_train, y_reg_train)
     rf_clf = train_random_forest_classifier(X_train, y_class_train)
 
@@ -496,10 +496,7 @@ if __name__ == "__main__":
         {'lr_reg': lr_res, 'rf_reg': rf_res, 'rf_clf': clf_res}
     )
 
-    # Attach model predictions to the test rows and save for simulate.py
     test_df = df.iloc[-len(X_test):].copy()
-    # .copy() creates a true independent copy — without it, pandas warns
-    # about modifying a "slice" of the original DataFrame
     test_df['lr_predicted_cpu'] = lr_reg.predict(X_test_sc)
     test_df['rf_predicted_cpu'] = rf_reg.predict(X_test)
     test_df['rf_spike_predicted'] = clf_res['predictions']
