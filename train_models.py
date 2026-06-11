@@ -155,3 +155,234 @@ def show_feature_importance(model, feature_names: list) -> pd.DataFrame:
     print("\n🔍 Top 10 most important features (Random Forest):")
     print(importance_df.head(10).to_string(index=False))
     return importance_df
+
+
+def train_random_forest_regressor(X_train, y_train):
+    """
+    Trains a Random Forest to predict the exact future CPU value (regression).
+
+    KEY CONCEPT — How a Decision Tree works:
+        A decision tree splits data with yes/no questions:
+            "Is cpu_lag_5 > 75?"
+            ├─ YES: "Is hour > 18?" → leaf: predict CPU = 88
+            └─ NO:  "Is is_weekend = 1?" → leaf: predict CPU = 42
+        It keeps splitting until it reaches "leaf" nodes with predictions.
+        One tree can overfit: it memorises the training data perfectly
+        but fails on new data.
+
+    KEY CONCEPT — How Random Forest fixes overfitting:
+        Step 1: Create 100 "bootstrap samples" from training data.
+                Bootstrap = sample WITH replacement (same row can appear twice).
+                Like shuffling a deck 100 times and dealing 100 different hands.
+
+        Step 2: Train ONE decision tree on EACH bootstrap sample.
+                At each split, each tree also randomly picks only a subset of
+                features to consider. This is the "random" in Random Forest.
+                → Every tree is slightly different. Each sees different data
+                and different features → each learns different patterns.
+
+        Step 3: Prediction = average of all 100 trees' predictions.
+                No single tree dominates. Their collective average is
+                robust and generalises well to new data.
+
+    KEY PARAMETERS EXPLAINED:
+        n_estimators=100     → number of trees.
+                               More trees = better accuracy but slower training.
+                               100 is a good starting point. 50 works too.
+
+        max_depth=10         → each tree can only be 10 levels deep.
+                               Without this limit, trees grow until every
+                               training sample is perfectly memorised (overfitting).
+
+        min_samples_leaf=15  → every leaf must represent at least 15 training samples.
+                               Prevents tiny leaves that memorise single data points.
+
+        n_jobs=-1            → use ALL available CPU cores to train trees in parallel.
+                               -1 is scikit-learn's convention for "use everything".
+                               Without this, trees are trained one at a time (slow).
+
+        random_state=42      → controls all internal randomness.
+                               Same seed = same forest every run = reproducible results.
+    """
+    print("\n🌲 Training Random Forest Regressor...")
+    print("   (building 100 trees — ~30 seconds)")
+    model = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=10,
+        min_samples_leaf=15,
+        n_jobs=-1,
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+    print("   ✅ Done")
+    return model
+
+
+def train_random_forest_classifier(X_train, y_train):
+    """
+    Trains a Random Forest to predict 0 or 1 (no spike / spike coming).
+
+    KEY CONCEPT — Regressor vs Classifier:
+        RandomForestRegressor  → predicts a continuous number  (e.g. "CPU will be 84.3%")
+        RandomForestClassifier → predicts a category            (e.g. "spike: YES or NO")
+
+        Internally they work almost identically.
+        The difference is in the leaf nodes:
+          - Regressor leaves store the average target value of their training samples
+          - Classifier leaves store the majority class of their training samples
+
+    KEY CONCEPT — predict() vs predict_proba():
+        model.predict(X)         → returns [0, 1, 0, 1, 0, ...]  (hard class labels)
+                                   Uses default threshold = 0.50
+        model.predict_proba(X)   → returns [[0.8, 0.2], [0.1, 0.9], ...]
+                                   Each row = [P(class 0), P(class 1)]
+                                   Column index 1 = probability of spike
+
+        We use predict_proba()[:,1] + our own threshold (0.78) instead of
+        predict() because the default 0.50 threshold fires too many false alarms.
+        Choosing our own threshold gives us direct control over precision.
+    """
+    print("\n🌲 Training Random Forest Classifier...")
+    model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
+        min_samples_leaf=15,
+        n_jobs=-1,
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+    print("   ✅ Done")
+    return model
+
+
+def evaluate_regressor(model, X_test, y_test, model_name: str) -> dict:
+    """
+    Measures how well the regression model predicts future CPU values.
+
+    KEY CONCEPT — MAE (Mean Absolute Error):
+        Step 1: For each test sample, compute |predicted_cpu - actual_cpu|
+        Step 2: Average all those absolute errors.
+        Result: "On average, my prediction is off by X percentage points."
+        MAE = 8.2% means on average we're 8.2 CPU percentage points off.
+        Easy to interpret. Treats a 1% error and a 10% error proportionally.
+
+    KEY CONCEPT — RMSE (Root Mean Squared Error):
+        Step 1: For each sample, compute (predicted - actual)²
+        Step 2: Average all the squared errors  (= MSE)
+        Step 3: Take the square root            (= RMSE, same units as CPU %)
+        RMSE PUNISHES large errors more than MAE because it squares them.
+        A 20% error contributes 400 to MSE.  A 2% error contributes only 4.
+        Use RMSE when large errors are especially bad (e.g. missing a big spike).
+
+    KEY CONCEPT — R² (R-squared, Coefficient of Determination):
+        Answers: "How much better is this model than just predicting the mean?"
+        R² = 1.0  → perfect predictions
+        R² = 0.0  → model is no better than always predicting the average CPU
+        R² = 0.7  → model explains 70% of the variance in actual CPU values
+        The closer to 1.0, the better.
+        R² measures: "how much closer are MY predictions to the diagonal line (perfect) compared to the flat average line?"
+    """
+    y_pred = model.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+
+    print(f"\n📊 {model_name} — Regression Results:")
+    print(f"   MAE  (avg CPU% error)         : {mae:.2f}%")
+    print(f"   RMSE (large errors penalised) : {rmse:.2f}%")
+    print(f"   R²   (1.0 = perfect)          : {r2:.4f}")
+
+    return {
+        'model_name': model_name,
+        'mae': round(mae, 4),
+        'rmse': round(rmse, 4),
+        'r2': round(r2, 4),
+        'predictions': y_pred       # keep predictions for simulate/visualize
+    }
+
+
+def evaluate_classifier(model, X_test, y_test) -> dict:
+    """
+    Measures how well the classifier detects upcoming spikes.
+
+    KEY CONCEPT — The Confusion Matrix:
+        After predicting on the test set we compare predicted vs actual:
+
+                              PREDICTED
+                          No Spike    Spike
+        ACTUAL  No Spike [ TN          FP  ]
+                   Spike [ FN          TP  ]
+
+        TP (True Positive) : Said SPIKE,    was a spike    ✅ caught it
+        TN (True Negative) : Said NO SPIKE, was no spike   ✅ correctly quiet
+        FP (False Positive): Said SPIKE,    was NOT spike  ❌ false alarm
+        FN (False Negative): Said NO SPIKE, WAS a spike    ❌ missed it
+
+    KEY CONCEPT — Precision:
+        TP / (TP + FP)
+        "Of every SPIKE WARNING we fired, what fraction were real spikes?"
+        HIGH precision = operators trust the warnings.
+        LOW precision  = so many false alarms that operators ignore them.
+        → This is your CV metric: "~87% precision"
+
+    KEY CONCEPT — Recall (also called Sensitivity):
+        TP / (TP + FN)
+        "Of every ACTUAL spike that happened, what fraction did we warn about?"
+        HIGH recall = we catch most spikes.
+        LOW recall  = many spikes slip through without warning.
+
+    KEY CONCEPT — Precision vs Recall trade-off:
+        You cannot maximise both at the same time.
+        Raising DECISION_THRESHOLD → precision goes up, recall goes down.
+        (We warn less often, but when we do, we're almost always right.)
+        Lowering DECISION_THRESHOLD → recall goes up, precision goes down.
+        (We warn more often, catching more spikes but also more false alarms.)
+        We chose 0.78 to prioritise precision for operational trustworthiness.
+
+    KEY CONCEPT — F1 Score:
+        2 × (Precision × Recall) / (Precision + Recall)
+        The harmonic mean of precision and recall.
+        A single number that balances both.
+        Useful when you want one number that summarises the classifier quality.
+    """
+    # predict_proba returns an array of shape (n_samples, 2):
+    #   column 0 = probability of class 0 (no spike)
+    #   column 1 = probability of class 1 (spike)
+    # [:, 1] selects ALL rows, column 1  →  spike probability for every sample
+    probs = model.predict_proba(X_test)[:, 1]
+
+    # Apply our tuned threshold to get binary predictions
+    # probs >= 0.78  →  boolean array True/False
+    # .astype(int)   →  converts to 1/0
+    y_pred = (probs >= DECISION_THRESHOLD).astype(int)
+
+    precision = precision_score(y_test, y_pred, zero_division=0)
+    recall = recall_score(y_test, y_pred,    zero_division=0)
+    f1 = f1_score(y_test, y_pred,         zero_division=0)
+    accuracy = accuracy_score(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred)
+
+    print(
+        f"\n📊 Random Forest Classifier (decision threshold = {DECISION_THRESHOLD}):")
+    print(f"   Accuracy  : {accuracy * 100:.1f}%")
+    print(f"   Precision : {precision * 100:.1f}%  ← this goes on your CV")
+    print(f"   Recall    : {recall * 100:.1f}%")
+    print(f"   F1 Score  : {f1 * 100:.1f}%")
+    print(
+        f"   Warnings fired : {y_pred.sum():,} out of {len(y_pred):,} test minutes")
+    print(f"\n   Confusion Matrix (rows=actual, cols=predicted):")
+    print(f"   [TN={cm[0, 0]:>5,}   FP={cm[0, 1]:>5,}]")
+    print(f"   [FN={cm[1, 0]:>5,}   TP={cm[1, 1]:>5,}]")
+
+    return {
+        'model_name': 'Random Forest Classifier',
+        'threshold': DECISION_THRESHOLD,
+        'accuracy': round(accuracy, 4),
+        'precision': round(precision, 4),
+        'recall': round(recall, 4),
+        'f1': round(f1, 4),
+        # .tolist() converts numpy array to plain Python list
+        'confusion_matrix': cm.tolist(),
+        'predictions': y_pred,
+        'probabilities': probs
+    }
