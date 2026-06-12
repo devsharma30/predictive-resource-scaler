@@ -149,3 +149,140 @@ class ScalingSimulator:
             With @property, it looks like a simple variable but acts like a function.
         """
         return self.total_breach_cost + self.total_instance_cost
+
+
+class ReactiveScaler(ScalingSimulator):
+    """
+    REACTIVE: "Act AFTER the problem is already happening."
+
+    Decision rule: if actual CPU right now > 80%, spin up an instance.
+    Flaw: the instance takes 3 minutes to boot. During those 3 minutes,
+    every minute counts as an SLA breach.
+    """
+
+    def __init__(self):
+        super().__init__("Reactive Scaling")
+
+    def step(self, actual_cpu: float, **kwargs):
+        # **kwargs lets ReactiveScaler.step() accept extra arguments it doesn't need, without crashing — so both classes can be called identically in the same loop.
+        # so both step() signatures are compatible in the loop below.
+        if actual_cpu > CPU_SPIKE_THRESHOLD:
+            self._try_spin_up()
+        return self._tick(actual_cpu)
+
+
+class ProactiveScaler(ScalingSimulator):
+    """
+    PROACTIVE: "Act BEFORE the problem, using ML prediction."
+
+    Decision rule: if our Random Forest predicts spike probability > 0.35,
+    spin up NOW. The 3-minute boot finishes before the spike arrives.
+
+    We also keep the reactive fallback as a safety net: if we missed
+    the prediction and CPU is already high, we still respond.
+    """
+
+    def __init__(self):
+        super().__init__("Proactive Scaling (ML)")
+
+    def step(self, actual_cpu: float, spike_prob: float = 0.0,
+             predicted_cpu: float = 0.0):
+        # Primary signal: ML spike probability
+        if spike_prob > PROACTIVE_TRIGGER_PROB or predicted_cpu > 74:
+            self._try_spin_up()
+        # Safety fallback: still react if already spiking
+        elif actual_cpu > CPU_SPIKE_THRESHOLD:
+            self._try_spin_up()
+        return self._tick(actual_cpu)
+
+
+def run_simulation(test_df: pd.DataFrame):
+    """
+    Iterates through every minute in the test set and runs both simulators.
+
+    KEY CONCEPT — iterrows():
+        df.iterrows() yields (index, row) tuples for every row.
+        row is a Pandas Series — access values with row['column_name'].
+        Slower than vectorised operations but necessary here because
+        the simulation has STATE that changes minute by minute
+        (we can't parallelise: minute 5's decision depends on minute 4's state).
+    """
+    print(f"\n⏳ Simulating {len(test_df):,} minutes...")
+
+    reactive = ReactiveScaler()
+    proactive = ProactiveScaler()
+
+    for _, row in test_df.iterrows():
+        actual_cpu = float(row['cpu_usage'])
+        spike_prob = float(row.get('rf_spike_prob', 0))
+        predicted_cpu = float(row.get('rf_predicted_cpu', actual_cpu))
+
+        reactive.step(actual_cpu)
+        proactive.step(actual_cpu, spike_prob=spike_prob,
+                       predicted_cpu=predicted_cpu)
+
+    print("   ✅ Done")
+    return reactive, proactive
+
+
+def print_and_return_results(reactive: ReactiveScaler, proactive: ProactiveScaler) -> dict:
+    """Prints side-by-side comparison and returns structured results dict."""
+    cost_saved = reactive.total_cost - proactive.total_cost
+    breach_reduced = reactive.total_sla_breaches - proactive.total_sla_breaches
+    pct_saved = (cost_saved / reactive.total_cost *
+                 100) if reactive.total_cost > 0 else 0
+
+    print("\n" + "=" * 62)
+    print("SIMULATION RESULTS")
+    print("=" * 62)
+    print(f"\n{'Metric':<32} {'Reactive':>12} {'Proactive (ML)':>14}")
+    print("-" * 60)
+    print(f"{'SLA Breach Minutes':<32} {reactive.total_sla_breaches:>12,} {proactive.total_sla_breaches:>14,}")
+    print(f"{'SLA Breach Cost ($)':<32} ${reactive.total_breach_cost:>11,.2f} ${proactive.total_breach_cost:>13,.2f}")
+    print(f"{'Instance Running Cost ($)':<32} ${reactive.total_instance_cost:>11,.2f} ${proactive.total_instance_cost:>13,.2f}")
+    print(f"{'TOTAL COST ($)':<32} ${reactive.total_cost:>11,.2f} ${proactive.total_cost:>13,.2f}")
+    print(f"{'Scale-Up Events':<32} {reactive.scale_up_count:>12,} {proactive.scale_up_count:>14,}")
+    print("-" * 60)
+    print(
+        f"\n  💰 Proactive saves: ${cost_saved:,.2f}  ({pct_saved:.1f}% reduction)")
+    print(f"  ⚡ SLA breach minutes reduced: {breach_reduced:,}")
+
+    return {
+        'reactive': {'strategy': reactive.name,
+                     'sla_breach_min': reactive.total_sla_breaches,
+                     'sla_breach_cost': round(reactive.total_breach_cost, 2),
+                     'instance_cost':   round(reactive.total_instance_cost, 2),
+                     'total_cost':      round(reactive.total_cost, 2),
+                     'scale_up_events': reactive.scale_up_count},
+        'proactive': {'strategy': proactive.name,
+                      'sla_breach_min': proactive.total_sla_breaches,
+                      'sla_breach_cost': round(proactive.total_breach_cost, 2),
+                      'instance_cost':   round(proactive.total_instance_cost, 2),
+                      'total_cost':      round(proactive.total_cost, 2),
+                      'scale_up_events': proactive.scale_up_count},
+        'cost_saved':     round(cost_saved, 2),
+        'breach_reduced': breach_reduced
+    }
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 62)
+    print("PREDICTIVE RESOURCE SCALER — SIMULATION")
+    print("=" * 62)
+
+    test_df = pd.read_csv("data/test_with_predictions.csv")
+    print(f"📂 Loaded {len(test_df):,} test rows")
+
+    reactive, proactive = run_simulation(test_df)
+    results = print_and_return_results(reactive, proactive)
+
+    os.makedirs("data", exist_ok=True)
+    pd.DataFrame(reactive.minute_log).to_csv(
+        "data/reactive_log.csv",   index=False)
+    pd.DataFrame(proactive.minute_log).to_csv(
+        "data/proactive_log.csv", index=False)
+    with open("data/simulation_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    print("\n✅ Logs saved. Next step: python visualize.py")
