@@ -281,3 +281,232 @@ def chart3_reactive_vs_proactive(reactive_log: list, proactive_log: list,
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"   ✅ Saved: {save_path}")
+
+
+def chart5_feature_importance(save_dir: str = "charts"):
+    """
+    Chart 5: Which features did the Random Forest rely on most?
+
+    KEY CONCEPT — Horizontal bar chart (barh):
+        ax.barh(y_positions, x_values)
+        'h' = horizontal — bars go left-to-right instead of bottom-to-top.
+        Better for labelling many categories (feature names) on the y-axis
+        because long text labels don't overlap each other.
+
+    KEY CONCEPT — Why we colour CPU-related features differently:
+        We use green for cpu/lag/rolling features and blue for time features.
+        This immediately shows the viewer: "temporal CPU history dominates,
+        time of day is secondary" — which is the key insight of our project.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = f"{save_dir}/05_feature_importance.png"
+
+    importance_path = "models/feature_importance.csv"
+    if not os.path.exists(importance_path):
+        print(
+            f"   ⚠️  {importance_path} not found — run train_models.py first")
+        return
+
+    imp_df = pd.read_csv(importance_path).head(15)   # top 15 features
+
+    # Colour bars: green if the feature is CPU/lag/rolling related, blue otherwise
+    colors = [
+        C_RF if any(kw in f for kw in ['cpu', 'lag', 'rolling', 'request'])
+        else C_ACTUAL
+        for f in imp_df['feature']
+    ]
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # invert_yaxis() puts the most important feature at the TOP of the chart
+    # Without it, the chart would show least important at the top (confusing)
+    bars = ax.barh(imp_df['feature'], imp_df['importance'],
+                   color=colors, alpha=0.85, edgecolor='white')
+    ax.invert_yaxis()
+
+    # Add exact importance value at the end of each bar
+    for bar, val in zip(bars, imp_df['importance']):
+        ax.text(val + 0.001, bar.get_y() + bar.get_height() / 2,
+                f'{val:.3f}', va='center', fontsize=9)
+
+    ax.set_xlabel('Feature Importance (higher = model relied on it more)')
+    ax.set_title('Random Forest Feature Importance\n'
+                 'What inputs matter most for predicting CPU spikes?')
+
+    # Manual legend explaining the colour coding
+    # Patch = a coloured rectangle for the legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=C_RF,     label='CPU / lag / rolling features'),
+        Patch(facecolor=C_ACTUAL, label='Time / other features'),
+    ]
+    ax.legend(handles=legend_elements, loc='lower right')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"   ✅ Saved: {save_path}")
+
+
+def chart4_cost_comparison(results: dict, save_dir: str = "charts"):
+    """
+    Chart 4: The business impact — side-by-side cost comparison.
+
+    KEY CONCEPT — Stacked bar chart:
+        A stacked bar groups multiple data categories into one bar.
+        Each segment = one cost component (breach penalty vs instance cost).
+        The total bar height = total cost.
+        Comparing two stacked bars immediately shows which strategy costs more.
+
+    KEY CONCEPT — np.arange(n):
+        Returns [0, 1, 2, ..., n-1] as a numpy array.
+        Used for bar positions on the x-axis.
+        We then offset bars left/right by ±width/2 to create grouped bars.
+
+    KEY CONCEPT — ax.text(x, y, string):
+        Places a text label at coordinates (x, y) on the chart.
+        We use it to put the actual dollar value on top of each bar.
+        ha='center' = horizontal alignment centred on x.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = f"{save_dir}/04_cost_comparison.png"
+
+    r = results['reactive']
+    p = results['proactive']
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle('Business Impact: Reactive vs Proactive Scaling Costs',
+                 fontsize=15, fontweight='bold')
+
+    # ── LEFT: Stacked cost breakdown ─────────────────────────────────────────
+    ax = axes[0]
+
+    categories = ['Reactive', 'Proactive (ML)']
+    breach_costs = [r['sla_breach_cost'],  p['sla_breach_cost']]
+    instance_costs = [r['instance_cost'],    p['instance_cost']]
+
+    x = np.arange(len(categories))   # [0, 1] — positions of the two bars
+    width = 0.45
+
+    # Bottom bars (SLA breach penalty)
+    bars1 = ax.bar(x, breach_costs, width,
+                   label='SLA Breach Penalty ($)',
+                   color=C_REACTIVE, alpha=0.85)
+
+    # Top bars (instance running cost) — stacked on top of breach costs
+    # 'bottom=breach_costs' tells matplotlib to start these bars at the
+    # top of the breach cost bars, not at zero
+    bars2 = ax.bar(x, instance_costs, width,
+                   bottom=breach_costs,
+                   label='Instance Running Cost ($)',
+                   color=C_LR, alpha=0.85)
+
+    # Label each segment with its dollar value
+    for bar, val in zip(bars1, breach_costs):
+        if val > 1:
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() / 2,
+                    f'${val:.0f}',
+                    ha='center', va='center',
+                    fontweight='bold', color='white', fontsize=10)
+
+    # Label total on top of each stacked bar
+    totals = [r['total_cost'], p['total_cost']]
+    for i, total in enumerate(totals):
+        ax.text(i, total + (max(totals) * 0.02),
+                f'Total\n${total:.0f}',
+                ha='center', fontweight='bold', fontsize=11)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories, fontsize=12)
+    ax.set_ylabel('Cost ($)')
+    ax.set_title('Total Cost Breakdown by Component')
+    ax.legend()
+
+    # ── RIGHT: Key metrics comparison (normalised bar chart) ─────────────────
+    ax = axes[1]
+
+    metrics = ['SLA Breach\nMinutes', 'Scale-Up\nEvents', 'Total\nCost ($)']
+    r_vals = [r['sla_breach_min'], r['scale_up_events'], r['total_cost']]
+    p_vals = [p['sla_breach_min'], p['scale_up_events'], p['total_cost']]
+
+    # Normalise to 0–100 scale so all three metrics fit on the same chart
+    # max_vals[i] = the larger of the two strategies for metric i
+    max_vals = [max(rv, pv) for rv, pv in zip(r_vals, p_vals)]
+    r_norm = [rv / mv * 100 if mv > 0 else 0 for rv,
+              mv in zip(r_vals, max_vals)]
+    p_norm = [pv / mv * 100 if mv > 0 else 0 for pv,
+              mv in zip(p_vals, max_vals)]
+
+    x2 = np.arange(len(metrics))
+    width = 0.35
+
+    ax.bar(x2 - width/2, r_norm, width, label='Reactive',
+           color=C_REACTIVE,  alpha=0.85)
+    ax.bar(x2 + width/2, p_norm, width, label='Proactive (ML)',
+           color=C_PROACTIVE, alpha=0.85)
+
+    # Place actual (un-normalised) values above each bar
+    for i, (rv, pv) in enumerate(zip(r_vals, p_vals)):
+        ax.text(i - width/2, r_norm[i] + 1.5,
+                f'{rv:.0f}', ha='center', fontsize=9, fontweight='bold')
+        ax.text(i + width/2, p_norm[i] + 1.5,
+                f'{pv:.0f}', ha='center', fontsize=9, fontweight='bold')
+
+    ax.set_xticks(x2)
+    ax.set_xticklabels(metrics, fontsize=11)
+    ax.set_ylabel('Relative score (lower = better)')
+    ax.set_title('Key Metrics Comparison (lower bar = better outcome)')
+    ax.legend()
+
+    # Add a savings annotation box in the corner
+    savings = results['cost_saved']
+    colour = 'lightgreen' if savings > 0 else '#ffcccc'
+    sign = '+' if savings > 0 else ''
+    ax.annotate(f"ML saves: {sign}${savings:.2f}",
+                xy=(0.97, 0.97), xycoords='axes fraction',
+                ha='right', va='top', fontsize=12, fontweight='bold',
+                color='green' if savings > 0 else 'red',
+                bbox=dict(boxstyle='round,pad=0.4', facecolor=colour, alpha=0.6))
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"   ✅ Saved: {save_path}")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 60)
+    print("PREDICTIVE RESOURCE SCALER — CHARTS")
+    print("=" * 60)
+
+    # ── Chart 1: Raw CPU pattern ──────────────────────────────────────────────
+    print("\n📊 Chart 1: Raw CPU pattern...")
+    df = pd.read_csv("data/processed_logs.csv")
+    chart1_raw_cpu_pattern(df)
+
+    # ── Chart 2: Actual vs Predicted ─────────────────────────────────────────
+    print("\n📊 Chart 2: Actual vs Predicted CPU...")
+    test_df = pd.read_csv("data/test_with_predictions.csv")
+    chart2_actual_vs_predicted(test_df)
+
+    # ── Chart 3: Reactive vs Proactive ───────────────────────────────────────
+    print("\n📊 Chart 3: Reactive vs Proactive scaling...")
+    reactive_log = pd.read_csv("data/reactive_log.csv").to_dict('records')
+    proactive_log = pd.read_csv("data/proactive_log.csv").to_dict('records')
+    # .to_dict('records') converts a DataFrame into a list of dicts —
+    # one dict per row. That's the format our chart function expects.
+    chart3_reactive_vs_proactive(reactive_log, proactive_log)
+
+    # ── Chart 4: Cost comparison ──────────────────────────────────────────────
+    print("\n📊 Chart 4: Cost comparison...")
+    with open("data/simulation_results.json") as f:
+        sim_results = json.load(f)
+    chart4_cost_comparison(sim_results)
+
+    # ── Chart 5: Feature importance ───────────────────────────────────────────
+    print("\n📊 Chart 5: Feature importance...")
+    chart5_feature_importance()
+
+    print("\n✅ All 5 charts saved to charts/")
