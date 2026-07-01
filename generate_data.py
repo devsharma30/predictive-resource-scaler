@@ -6,132 +6,175 @@
 
 
 #   we ware targetting to take 90 days of per-minute CPU readings.[Rows: 90 × 24 × 60 = 129,600 (one row per minute)]
+#
+#   WHY RAMP-UP MATTERS:
+#   Real CPU spikes don't appear from nowhere — traffic builds over minutes
+#   before a spike. We simulate this with a clear 20-minute ramp-up phase.
+#   This gives the ML model a genuine signal to learn from:
+#   "CPU has been climbing steadily for 15 minutes → spike incoming."
+#
 
 import numpy as np
 import pandas as pd
 import os
 
-
 np.random.seed(42)
 
+# =============================================================================
+# PARAMETERS
+# =============================================================================
 
-def generate_server_data(days: int = 90) -> pd.DataFrame:
+DAYS = 90
+MINUTES_PER_DAY = 1440
+TOTAL_MINUTES = DAYS * MINUTES_PER_DAY   # 129,600 rows
+
+BASE_CPU = 38.0          # idle baseline (%)
+NOISE_STD = 3.0          # gaussian noise (smaller = cleaner ramp-up signal)
+
+SPIKE_PROBABILITY = 0.020   # ~2% of minutes START a new spike event
+
+# Spike shape parameters — 3 phases:
+RAMP_UP_MINUTES = 20        # Phase 1: CPU climbs over 20 minutes
+# WHY 20: gives model 15 minutes of advance warning
+#         before CPU crosses 80% (at ~minute 15 of ramp)
+SPIKE_SUSTAIN_MINUTES = 10  # Phase 2: CPU stays at peak
+RAMP_DOWN_MINUTES = 15      # Phase 3: CPU falls back to normal
+
+SPIKE_BASE_MAGNITUDE = 45   # spike adds this much on top of current base CPU
+# e.g. base=40, magnitude=45 → peak CPU = 85% (above 80%)
+SPIKE_MAG_VARIANCE = 10     # ±10 variation so spikes are not all identical
+
+
+def generate_base_cpu(n: int) -> np.ndarray:
     """
-    Generates realistic-looking server CPU data for a given number of days.
+    Creates background CPU: daily sine wave + weekly wave + noise.
+    No spikes here — those are injected separately.
+    """
+    t = np.arange(n)
 
-    Parameters:
-        days (int): How many days of data to generate. Default = 90.
+    daily_wave = 18.0 * np.sin(2 * np.pi * t / MINUTES_PER_DAY - 1.8326)
+    weekly_wave = 6.0 * np.sin(2 * np.pi * t /
+                               (7 * MINUTES_PER_DAY) - np.pi / 2)
+    noise = np.random.normal(0, NOISE_STD, n)
+
+    return BASE_CPU + daily_wave + weekly_wave + noise
+
+
+def inject_spikes_with_rampup(base_cpu: np.ndarray) -> tuple:
+    """
+    Injects spike events with three phases: ramp-up → sustain → ramp-down.
+
+    WHY THIS DESIGN:
+    The ramp-up phase is the key. During ramp-up, cpu_delta_5 (5-minute rate
+    of change) will be +3 to +4 per minute. cpu_rolling_mean_5 will be rising.
+    cpu_lag_1, cpu_lag_5 will show an increasing sequence.
+
+    The classifier learns: "rising delta + rising lags + hour in [9-17] = spike soon."
+    This gives GENUINE 5-minute-ahead predictability.
+
+    No ramp-up (old design) → model can't predict → leakage → bad project.
+    With ramp-up → model learns real pattern → honest predictive signal.
 
     Returns:
-        pd.DataFrame: A table where each row = 1 minute of server activity.
-
-    HOW THE SIMULATION WORKS:
-        CPU = base(45%) + daily_wave + weekly_wave + noise + spikes
-        Each component adds a layer of realism.
+      cpu: the modified cpu array with spikes injected
+      spike_mask: True at each minute that is part of a spike event
     """
+    n = len(base_cpu)
+    extra_cpu = np.zeros(n)      # extra CPU load from spike events
+    spike_mask = np.zeros(n, dtype=bool)
 
-    total_minutes = days * 24 * 60
+    i = 0
+    event_len = RAMP_UP_MINUTES + SPIKE_SUSTAIN_MINUTES + RAMP_DOWN_MINUTES
 
+    while i < n - event_len - 30:
+        if np.random.random() < SPIKE_PROBABILITY:
+            magnitude = SPIKE_BASE_MAGNITUDE + \
+                np.random.uniform(-SPIKE_MAG_VARIANCE, SPIKE_MAG_VARIANCE)
+
+            # Phase 1: RAMP-UP — linear increase from 5% to full magnitude
+            # Starting at 5% (not 0) makes the ramp visible from the very first minute.
+            for j, ramp_val in enumerate(np.linspace(magnitude * 0.08, magnitude, RAMP_UP_MINUTES)):
+                extra_cpu[i + j] += ramp_val
+                spike_mask[i + j] = True
+
+            # Phase 2: SUSTAIN — hold at peak
+            for j in range(SPIKE_SUSTAIN_MINUTES):
+                extra_cpu[i + RAMP_UP_MINUTES + j] += magnitude
+                spike_mask[i + RAMP_UP_MINUTES + j] = True
+
+            # Phase 3: RAMP-DOWN — linear return to 0
+            for j, ramp_val in enumerate(np.linspace(magnitude, 0, RAMP_DOWN_MINUTES)):
+                extra_cpu[i + RAMP_UP_MINUTES +
+                          SPIKE_SUSTAIN_MINUTES + j] += ramp_val
+                spike_mask[i + RAMP_UP_MINUTES +
+                           SPIKE_SUSTAIN_MINUTES + j] = True
+
+            # Gap between spikes: at least 30 minutes so events don't overlap
+            gap = np.random.randint(30, 80)
+            i += event_len + gap
+        else:
+            i += 1
+
+    cpu = base_cpu + extra_cpu
+    cpu = np.clip(cpu, 5, 100)
+    return cpu, spike_mask
+
+
+def generate_request_count(cpu: np.ndarray) -> np.ndarray:
+    """
+    Request count: correlated with CPU but not perfectly.
+    Slightly leads CPU (traffic causes load, not the other way around).
+    """
+    requests = cpu * 13 + np.random.normal(0, 70, len(cpu))
+    return np.clip(requests, 10, 2000).astype(int)
+
+
+def generate_memory_usage(cpu: np.ndarray) -> np.ndarray:
+    """
+    Memory: slower-moving, dampened version of CPU + independent noise.
+    """
+    memory = 32 + 0.32 * cpu + np.random.normal(0, 2.5, len(cpu))
+    return np.clip(memory, 20, 92)
+
+
+def main():
+    print("=" * 60)
+    print("generate_data.py — Creating synthetic server logs")
+    print("=" * 60)
+
+    os.makedirs('data', exist_ok=True)
+
+    print(
+        f"Generating {TOTAL_MINUTES:,} rows ({DAYS} days × {MINUTES_PER_DAY} min/day)...")
+
+    base_cpu = generate_base_cpu(TOTAL_MINUTES)
+    cpu, spike_mask = inject_spikes_with_rampup(base_cpu)
+    requests = generate_request_count(cpu)
+    memory = generate_memory_usage(cpu)
     timestamps = pd.date_range(
-        start='2024-01-01',
-        periods=total_minutes,
-        freq='min'            # 'min' = 1 minute [gap between timestamps]
-    )
+        start='2024-01-01 00:00:00', periods=TOTAL_MINUTES, freq='min')
 
-    hour_of_day = timestamps.hour         # array of 129,600 values, each 0–23
-    day_of_week = timestamps.dayofweek    # array of 129,600 values, each 0–6
-
-    # Why a sine wave?(same type of explanatoion for cosine wave)
-    #   A sine wave (np.sin) oscillates smoothly between -1 and +1.
-    #   Real CPU usage rises and falls smoothly throughout the day —
-    #   that's also a wave. Sine is the natural mathematical model for it.
-
-    #   np.sin(2π × hour / 24) completes exactly ONE full wave per day.
-
-    #   for our purpose not necessary, but we want the PEAK at ~2 PM
-    #   Shifting by -6: (hour - 6) / 24 × 2π moves the peak to 2 PM.(as old peak if not shifted was at 6am)
-    daily_wave = np.sin(2 * np.pi * (hour_of_day - 6) / 24)
-
-    # To Build the weekly pattern
-    # Weekday traffic > weekend traffic for most business applications.
-    # We use a cosine wave across 7 days
-    weekly_wave = np.cos(2 * np.pi * day_of_week / 7) * 0.15
-
-    # These values — 45% base, ±25% daily swing, ±10% weekly swing — are reasonable approximations for a general web application. not in real world .
-    base_cpu = 45 + (daily_wave * 25) + (weekly_wave * 10)
-
-    #   to add random noise:->
-    #   np.random.normal(mean, std_dev, size) generates random numbers.
-    noise = np.random.normal(0, 5, total_minutes)
-
-    # To inject sudden traffic spikes
-    #   These can't be captured by a smooth wave. We inject them manually.
-    # np.zeros creates an array of all 0.0 values (no spike at any minute yet)
-    spikes = np.zeros(total_minutes)
-
-    spike_starts = np.random.choice(
-        total_minutes,
-        size=int(total_minutes * 0.02),
-        replace=False   # False = no index picked twice (no overlapping spikes)
-    )
-
-    for idx in spike_starts:
-        # Each spike lasts between 5 and 15 minutes(picking random integer between 5 and 15)
-        duration = np.random.randint(5, 15)
-
-        # Each spike adds between +20% and +40% CPU usage (picking random float between 20 and 40)
-        magnitude = np.random.uniform(20, 40)
-
-        # min(...) prevents the spike from going past the end of our array
-        end = min(idx + duration, total_minutes)
-
-        # Add the spike magnitude to every minute in the spike window
-        spikes[idx:end] += magnitude
-
-    # Now we have to combine everything to get the final CPU usage for each minute :->
-    cpu_usage = base_cpu + noise + spikes
-
-    # CPU usage can't be negative or above 100%, so we clip it to that range.
-    cpu_usage = np.clip(cpu_usage, 5, 100)
-
-    # Request count correlates with CPU: more requests = more CPU used.
-    # We model it as: requests = cpu × 50 + noise
-    request_count = (cpu_usage * 50) + np.random.normal(0, 200, total_minutes)
-    request_count = np.clip(request_count, 0, None).astype(int)
-
- # Memory usage loosely follows CPU but with its own noise
-    memory_usage = 30 + (cpu_usage * 0.4) + \
-        np.random.normal(0, 3, total_minutes)
-    memory_usage = np.clip(memory_usage, 10, 95)
-
-    # Now at last let us build the DataFrame
     df = pd.DataFrame({
-        'timestamp': timestamps,
-        # .round(2) -> keep 2 decimal places
-        'cpu_usage': cpu_usage.round(2),
-        'request_count': request_count,
-        'memory_usage': memory_usage.round(2)
+        'timestamp':     timestamps,
+        'cpu_usage':     np.round(cpu, 2),
+        'request_count': requests,
+        'memory_usage':  np.round(memory, 2),
+        'is_spike_minute': spike_mask.astype(int),
     })
 
-    return df
+    path = 'data/server_logs.csv'
+    df.to_csv(path, index=False)
+
+    spike_mins = spike_mask.sum()
+    high_cpu = (cpu > 80).sum()
+    print(f"\n✓ Data generated: {len(df):,} rows")
+    print(
+        f"  Spike event minutes : {spike_mins:,} ({100*spike_mins/TOTAL_MINUTES:.1f}%)")
+    print(
+        f"  Minutes above 80%   : {high_cpu:,} ({100*high_cpu/TOTAL_MINUTES:.1f}%)")
+    print(f"  CPU mean / max      : {cpu.mean():.1f}% / {cpu.max():.1f}%")
+    print(f"\n✓ Saved → {path}")
 
 
-if __name__ == "__main__":
-
-    print("🔧 Generating synthetic server data...")
-
-    # Here-> exist_ok=True means: if data/ already exists, don't raise an error.
-    os.makedirs("data", exist_ok=True)
-
-    df = generate_server_data(days=90)
-
-    df.to_csv("data/server_logs.csv", index=False)
-
-    print(f"✅ Generated {len(df):,} rows of server data")
-    print(f"   Date range : {df['timestamp'].min()} → {df['timestamp'].max()}")
-    print(f"   CPU min    : {df['cpu_usage'].min():.1f}%")
-    print(f"   CPU max    : {df['cpu_usage'].max():.1f}%")
-    print(f"   CPU mean   : {df['cpu_usage'].mean():.1f}%")
-    print(f"   Spike rows (CPU > 80%) : {(df['cpu_usage'] > 80).sum():,}")
-    print(f"\n📁 Saved → data/server_logs.csv")
-    print(f"\n✅ Next step: python data_prep.py")
+if __name__ == '__main__':
+    main()
