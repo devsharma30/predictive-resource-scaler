@@ -3,6 +3,6 @@ __pycache__/
 venv/
 data/
 models/
-charts/
+#charts/
 .vscode/
 .DS_Store
