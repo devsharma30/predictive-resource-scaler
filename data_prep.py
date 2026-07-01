@@ -12,334 +12,212 @@ import pandas as pd
 import numpy as np
 import os
 
+# =============================================================================
+# PARAMETERS
+# =============================================================================
 
-def load_data(filepath: str = "data/server_logs.csv") -> pd.DataFrame:
-    """
-    Loads the CSV into a DataFrame and parses the timestamp column.
+PREDICT_AHEAD = 5       # predict whether a spike happens 5 minutes FROM NOW
+SPIKE_THRESHOLD = 80    # CPU above 80% = spike (matches SLA breach threshold)
 
-    WHY parse_dates / pd.to_datetime?
-        By default, pd.read_csv reads EVERY column as a plain string.
-        The timestamp column would arrive as the string "2024-01-01 00:00:00"
-        not as an actual date/time object.
-        We need it as a real datetime so we can call .dt.hour, .dt.dayofweek, etc.
-    """
-    print(f"📂 Loading data from {filepath}...")
-    df = pd.read_csv(filepath)
+
+def load_data(path: str) -> pd.DataFrame:
+    print(f"Loading data from {path}...")
+    df = pd.read_csv(path)
     df['timestamp'] = pd.to_datetime(df['timestamp'])
-    print(f"   ✅ Loaded {len(df):,} rows | columns: {list(df.columns)}")
-    return df
 
+    # KEY CONCEPT — pd.to_datetime():
+    #   Converts string timestamps to datetime objects.
+    #   Once a datetime, we can extract .hour, .day_of_week, etc.
+    #   Without this, 'timestamp' is just a string — useless to the model.
 
-def check_data_quality(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Always inspect your data before modelling. Real datasets are messy.
-    This function prints a quality report so you know what you're working with.
-
-    WHAT WE CHECK:
-        Missing values  → NaN (Not a Number) = missing entry in a cell.
-                          If columns have NaNs, most ML models will crash or
-                          silently produce wrong results.
-        Data types      → Are numbers stored as numbers or as strings?
-        Basic stats     → Is the CPU range sane (0–100)? Any negatives?
-    """
-    print("\n🔍 Data Quality Check:")
-
-    missing = df.isnull().sum()
-    print(f"   Missing values:\n{missing.to_string()}")
-
-    # .dtypes shows the data type of each column
-    print(f"\n   Data types:\n{df.dtypes.to_string()}")
-
-    # .describe() computes count, mean, std, min, quartiles, max for all numeric cols
-    print(f"\n   Statistics:\n{df.describe().round(2).to_string()}")
-
+    print(f"  Loaded {len(df):,} rows")
     return df
 
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Extracts useful time information from the timestamp column.
-
-    KEY CONCEPT — The .dt accessor:
-        When a Pandas column holds datetime objects, the .dt accessor
-        lets you extract components from every row at once.
-
-        df['timestamp'].dt.hour       → array of hours (0–23)
-        df['timestamp'].dt.dayofweek  → array of weekday numbers (0=Mon)
-        df['timestamp'].dt.month      → array of month numbers (1–12)
-
-        This is vectorised: it runs on the whole column at once,
-        much faster than looping row by row.
-
-    WHY THESE FEATURES HELP THE MODEL:
-        - CPU at 2 PM is typically higher than at 2 AM
-          → the model needs to know the hour
-        - Weekday vs weekend has different traffic patterns
-          → the model needs day_of_week
+    WHY: Time features capture WHEN spikes happen.
+    CPU spikes cluster at business hours (hour=9-17), weekdays (day_of_week<5).
+    The model uses these to learn: "if it's 2 PM on a Tuesday, spikes are likely."
     """
-    print("\n⚙️  Adding time features...")
-
-    df['hour'] = df['timestamp'].dt.hour         # 0 to 23
-    df['minute'] = df['timestamp'].dt.minute       # 0 to 59
-    df['day_of_week'] = df['timestamp'].dt.dayofweek    # 0=Monday, 6=Sunday
-    df['day_of_month'] = df['timestamp'].dt.day          # 1 to 31
-    df['month'] = df['timestamp'].dt.month        # 1 to 12
-
-    #   ML models need numbers, not True/False.
+    df['hour'] = df['timestamp'].dt.hour
+    df['minute'] = df['timestamp'].dt.minute
+    df['day_of_week'] = df['timestamp'].dt.dayofweek   # 0=Monday, 6=Sunday
+    df['day_of_month'] = df['timestamp'].dt.day
+    df['month'] = df['timestamp'].dt.month
     df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-
-    print("   ✅ Added: hour, minute, day_of_week, day_of_month, month, is_weekend")
     return df
 
 
 def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Creates "lag" features: what was the CPU value N minutes ago?
+    WHY LAG FEATURES (and why NO raw cpu_usage):
+    A single snapshot of CPU at minute T can't tell you if CPU is RISING or FALLING.
+    Lag features give the model a "rear-view mirror":
+      cpu_lag_1  = CPU 1 minute ago
+      cpu_lag_5  = CPU 5 minutes ago
+      cpu_lag_10 = CPU 10 minutes ago
+      cpu_lag_30 = CPU 30 minutes ago
 
-    KEY CONCEPT — Why lag features?
-        The model only sees ONE row at a time when making a prediction.
-        Without lag features, it can only see the current minute's data.
-        With lag features, it also sees the RECENT HISTORY — the trend.
+    If the model sees: cpu_lag_30=45%, cpu_lag_10=55%, cpu_lag_5=65%, cpu_lag_1=72%
+    → it can detect the ramp-up trend → predict spike in 5 minutes.
 
-        EXAMPLE without lags:
-            Current CPU = 72%.  Is this going up or down?  Can't tell.
-
-        EXAMPLE with lags:
-            Current CPU = 72%.  5 mins ago = 55%.  10 mins ago = 40%.
-            → CPU is RISING FAST.  Spike is likely coming.
+    This is the signal we designed the data generator to produce (Phase 1 = ramp-up).
 
     KEY CONCEPT — .shift(n):
-        .shift(n) moves every value DOWN by n rows.
-
-        Original:       After .shift(1):
-        Row 0: CPU=30   Row 0: NaN       ← no "1 minute ago" for the first row
-        Row 1: CPU=35   Row 1: 30        ← 1 min ago was row 0 = 30
-        Row 2: CPU=40   Row 2: 35        ← 1 min ago was row 1 = 35
-        Row 3: CPU=45   Row 3: 40
-
-        So df['cpu_lag_1'].iloc[k] = df['cpu_usage'].iloc[k-1]
-        "At minute k, cpu_lag_1 tells you what CPU was at minute k-1"
+      Moves every value DOWN by n rows.
+      cpu_lag_5 at row 100 = cpu_usage at row 95 = "5 minutes ago"
+      The CURRENT cpu_usage is intentionally NOT included as a raw feature
+      because it causes data leakage (see file header).
     """
-    print("\n⚙️  Adding lag features...")
+    df['cpu_lag_1'] = df['cpu_usage'].shift(1)
+    df['cpu_lag_5'] = df['cpu_usage'].shift(5)
+    df['cpu_lag_10'] = df['cpu_usage'].shift(10)
+    df['cpu_lag_30'] = df['cpu_usage'].shift(30)
 
-    df['cpu_lag_1'] = df['cpu_usage'].shift(1)    # 1 minute ago
-    df['cpu_lag_5'] = df['cpu_usage'].shift(5)    # 5 minutes ago
-    df['cpu_lag_10'] = df['cpu_usage'].shift(10)   # 10 minutes ago
-    df['cpu_lag_30'] = df['cpu_usage'].shift(30)   # 30 minutes ago
-
-    # Also lag the request count — high recent requests predict high future CPU
+    # Request count lags — helpful since request_count sometimes spikes BEFORE CPU
     df['req_lag_1'] = df['request_count'].shift(1)
     df['req_lag_5'] = df['request_count'].shift(5)
 
-    print("   ✅ Added: cpu_lag_1, cpu_lag_5, cpu_lag_10, cpu_lag_30, req_lag_1, req_lag_5")
     return df
 
 
 def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Creates rolling (moving) window statistics.
+    WHY ROLLING FEATURES:
+    Lag features are single point-in-time snapshots.
+    Rolling features summarise a WINDOW of recent history — more robust to noise.
 
-    KEY CONCEPT — Rolling averages:
-        A rolling mean looks at the last N values and takes their average.
-        This SMOOTHS OUT noise and reveals the true underlying trend.
+      Rolling mean  = average CPU over past N minutes (smoothed trend)
+      Rolling std   = how variable CPU has been (rising std = instability)
+      Rolling max   = highest CPU seen in past N minutes (worst-case recent)
 
-        RAW CPU readings: [45, 92, 46, 47, 48]
-        The 92 is a 1-minute spike (maybe a GC pause).
-        Rolling mean (5): (45+92+46+47+48) / 5 = 55.6
-        → 55.6 tells a more honest story about the current CPU "level"
-
-    KEY CONCEPT — .rolling(window=n).mean():
-        .rolling(window=5) says "create a sliding window of 5 rows".
-        .mean() computes the average of each window.
-        min_periods=1 means: even if the window has fewer than n values
-        (e.g. the first 4 rows before we have 5), still compute the mean.
-        Without min_periods=1, those early rows would be NaN.
-
-    KEY CONCEPT — Standard deviation (std):
-        Measures how much values are SPREAD OUT around the mean.
-        Low std = CPU is stable.
-        High std = CPU is bouncing around = might be about to spike.
-        This volatility is a useful signal for the model.
+    KEY CONCEPT — .rolling(window).mean():
+      At row 100, rolling_mean_15 = average of rows 86 to 100 (past 15 minutes).
+      min_periods=1 prevents NaN at start of dataset (uses whatever data exists).
     """
-    print("\n⚙️  Adding rolling features...")
-
-    df['cpu_rolling_mean_5'] = df['cpu_usage'].rolling(
-        window=5,  min_periods=1).mean()
+    # Rolling means at different time horizons
+    df['cpu_rolling_mean_5'] = df['cpu_usage'].rolling(5, min_periods=1).mean()
     df['cpu_rolling_mean_15'] = df['cpu_usage'].rolling(
-        window=15, min_periods=1).mean()
+        15, min_periods=1).mean()
     df['cpu_rolling_mean_30'] = df['cpu_usage'].rolling(
-        window=30, min_periods=1).mean()
+        30, min_periods=1).mean()
 
+    # Rolling std — captures volatility
+    # WHY: Steady CPU at 70% is very different from CPU oscillating 60-80%.
+    # std captures that difference; a rising std often precedes a spike.
     df['cpu_rolling_std_5'] = df['cpu_usage'].rolling(
-        window=5,  min_periods=1).std().fillna(0)
+        5, min_periods=1).std().fillna(0)
     df['cpu_rolling_std_15'] = df['cpu_usage'].rolling(
-        window=15, min_periods=1).std().fillna(0)
+        15, min_periods=1).std().fillna(0)
 
-    df['cpu_rolling_max_15'] = df['cpu_usage'].rolling(
-        window=15, min_periods=1).max()
+    # Rolling max — captures if ANY recent minute was dangerously high
+    df['cpu_rolling_max_15'] = df['cpu_usage'].rolling(15, min_periods=1).max()
 
-    print("   ✅ Added: rolling mean/std/max across 5, 15, 30 minute windows")
-    return df
+    # Rolling request count trends
+    df['req_rolling_mean_5'] = df['request_count'].rolling(
+        5, min_periods=1).mean()
 
-# What create_target_variable() does — it is NOT predicting anything.
-# It is just labelling the existing data.
-
-
-def create_target_variable(df: pd.DataFrame,
-                           threshold: int = 78,
-                           predict_ahead: int = 5) -> pd.DataFrame:
-    """
-    Creates the TARGET variable — the value the model is trained to predict.
-
-    KEY CONCEPT — What is the target?
-        In supervised learning, the "target" (also called label or y) is
-        the answer we want the model to learn to predict.
-        All other columns are "features" (inputs). The target is the output.
-
-        Our target: "Will CPU exceed 78% exactly 5 minutes from now?"
-        Answer: 1 (yes, spike coming) or 0 (no spike coming)
-
-    KEY CONCEPT — .shift(-n) for looking FORWARD:
-        Normal .shift(n) looks backward (lag).
-        .shift(-n) looks FORWARD in time.
-
-        Original:           After .shift(-5):
-        Row 0: CPU=40       Row 0: 35    ← value from row 5
-        Row 1: CPU=50       Row 1: 72    ← value from row 6
-        ...
-        Row N-5: CPU=35     Row N-5: NaN ← no future row exists
-        Row N-4: CPU=72     Row N-4: NaN
-        ...
-
-        So: df['cpu_usage'].shift(-5).iloc[k]
-              = df['cpu_usage'].iloc[k+5]
-              = "what CPU will be 5 minutes from now"
-
-    WHY THRESHOLD = 78 (not 80)?
-        We set the SPIKE DEFINITION at 78% (slightly below the 80% SLA limit).
-        This gives the model slightly earlier warning and improves precision.
-    """
-    print(
-        f"\n⚙️  Creating target variable (spike in {predict_ahead} min, threshold={threshold}%)...")
-
-    future_cpu = df['cpu_usage'].shift(-predict_ahead)
-
-    df['spike_in_5min'] = (future_cpu > threshold).astype(int)
-    df['future_cpu_5min'] = future_cpu
-
-    spike_pct = df['spike_in_5min'].mean() * 100
-    print(f"   ✅ Target created: spike_in_5min (1 = spike coming, 0 = safe)")
-    print(
-        f"   📊 {spike_pct:.1f}% of minutes have a spike in the next {predict_ahead} min")
     return df
 
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+def add_rate_of_change(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Drops rows that have NaN values introduced by lag/shift operations.
+    WHY RATE OF CHANGE:
+    This is the most direct feature for detecting a ramp-up.
+    cpu_delta_5 = how much CPU has increased in the last 5 minutes.
+    If cpu_delta_5 = +15, CPU is rising fast → spike likely.
+    If cpu_delta_5 = -5, CPU is falling → no spike.
 
-    WHY ARE THERE NaNs?
-        - cpu_lag_30: the first 30 rows have no "30 minutes ago" data
-        - spike_in_5min: the last 5 rows have no "5 minutes in the future" data
-        → These rows have NaN in at least one column.
-
-    Most ML models crash on NaN inputs. .dropna() removes every row
-    that has ANY NaN value in ANY column.
-
-    WHY NOT fill NaNs instead of dropping?
-        Filling lag features with fake values (like 0 or the column mean)
-        would corrupt the temporal signal. Dropping is safer here
-        because we lose only ~35 rows out of 129,600 — negligible.
+    This feature directly captures the ramp-up pattern we designed into the data.
     """
-    print(f"\n🧹 Cleaning: dropping NaN rows...")
-    before = len(df)
-    df = df.dropna()
-    after = len(df)
-    print(
-        f"   Rows before: {before:,}  →  after: {after:,}  (removed {before - after})")
+    df['cpu_delta_5'] = df['cpu_usage'].diff(
+        5).fillna(0)    # change over 5 min
+    df['cpu_delta_15'] = df['cpu_usage'].diff(
+        15).fillna(0)  # change over 15 min
     return df
 
 
-def prepare_features_labels(df: pd.DataFrame):
+def create_target(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Separates the DataFrame into:
-        X        → feature matrix  (inputs to the model)
-        y_class  → classification target  (0 or 1: will there be a spike?)
-        y_reg    → regression target      (exact future CPU value)
+    WHY: The model needs to know WHAT to predict.
+    We want to predict: "Will CPU exceed 80% in the next 5 minutes?"
 
-    COLUMNS EXCLUDED FROM X:
-        - timestamp     : a string/datetime — not a useful number for the model
-        - future_cpu_5min : this IS what we're predicting → including it as
-                            a feature would be "cheating" (data leakage)
-        - spike_in_5min   : same — it's our target label, not an input
-        - time_of_day     : categorical string ('morning', 'evening') —
-                            needs extra encoding we skip for simplicity
+    KEY CONCEPT — .shift(-n):
+      NEGATIVE shift moves values UP by n rows.
+      cpu_future_5 at row 100 = cpu_usage at row 105 = "5 minutes from now"
+      This is the target. We check if that future CPU > SPIKE_THRESHOLD.
+      Result is 0 or 1 (binary classification problem).
+
+    WHY BINARY (0/1) INSTEAD OF EXACT CPU VALUE:
+      We don't need to predict exact future CPU — we just need to know
+      "will it spike?" to decide whether to boot a new instance.
+      Binary classification is a cleaner, more actionable problem.
     """
-    print(f"\n📦 Preparing feature matrix X and label vector y...")
+    df['cpu_future_5'] = df['cpu_usage'].shift(-PREDICT_AHEAD)
 
-    feature_cols = [
-        'hour', 'minute', 'day_of_week', 'day_of_month', 'month', 'is_weekend',
-        'cpu_usage',
-        'cpu_lag_1', 'cpu_lag_5', 'cpu_lag_10', 'cpu_lag_30',
-        'req_lag_1', 'req_lag_5',
-        'cpu_rolling_mean_5', 'cpu_rolling_mean_15', 'cpu_rolling_mean_30',
-        'cpu_rolling_std_5', 'cpu_rolling_std_15',
-        'cpu_rolling_max_15',
-        'request_count', 'memory_usage'
-    ]
+    # spike_in_5min = 1 if CPU will be above threshold in 5 minutes, else 0
+    df['spike_in_5min'] = (df['cpu_future_5'] > SPIKE_THRESHOLD).astype(int)
 
-    X = df[feature_cols]
-    y_class = df['spike_in_5min']
-    y_reg = df['future_cpu_5min']
-
-    # .shape returns (rows, columns) as a tuple
-    print(
-        f"   X shape: {X.shape}  ({X.shape[1]} features × {X.shape[0]:,} samples)")
-    return X, y_class, y_reg, df
+    return df
 
 
-def time_based_split(X, y_class, y_reg, test_ratio: float = 0.2):
-    """
-    Splits data into training and test sets CHRONOLOGICALLY.
+def main():
+    print("=" * 60)
+    print("data_prep.py — Feature Engineering")
+    print("=" * 60)
 
-        The model only sees past data. Just like in real life.
-        If we shuffled the data randomly, the model could see "future" rows
-        during training, which would be unrealistic and lead to overfitting.
-    """
-    print(
-        f"\n✂️  Time-based split: {int((1-test_ratio)*100)}% train / {int(test_ratio*100)}% test...")
+    os.makedirs('data', exist_ok=True)
 
-    n = len(X)
-    split_point = int(n * (1 - test_ratio))    # e.g. 129565 × 0.8 = 103,652
+    df = load_data('data/server_logs.csv')
 
-    X_train = X.iloc[:split_point]
-    X_test = X.iloc[split_point:]
-    y_class_train = y_class.iloc[:split_point]
-    y_class_test = y_class.iloc[split_point:]
-    y_reg_train = y_reg.iloc[:split_point]
-    y_reg_test = y_reg.iloc[split_point:]
-
-    print(f"   Train: {len(X_train):,} rows  |  Test: {len(X_test):,} rows")
-    return X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
-
-
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-
-    df = load_data()
-    df = check_data_quality(df)
+    print("Engineering features...")
     df = add_time_features(df)
     df = add_lag_features(df)
     df = add_rolling_features(df)
-    df = create_target_variable(df)
-    df = clean_data(df)
+    df = add_rate_of_change(df)
+    df = create_target(df)
 
-    X, y_class, y_reg, df = prepare_features_labels(df)
-    X_train, X_test, yct, yc_test, yrt, yr_test = time_based_split(
-        X, y_class, y_reg)
+    # Drop rows with NaN from lag/rolling operations at start and end of dataset.
+    # WHY: First 30 rows have incomplete lags (not enough history yet).
+    #      Last 5 rows have NaN targets (no future data to look at).
+    rows_before = len(df)
+    df.dropna(inplace=True)
+    rows_after = len(df)
+    print(
+        f"  Dropped {rows_before - rows_after:,} rows (NaN from lags/targets)")
 
-    os.makedirs("data", exist_ok=True)
-    df.to_csv("data/processed_logs.csv", index=False)
+    # Final feature set — these are the columns the model trains on.
+    # NOTE: cpu_usage is NOT in this list (intentional — see header for why).
+    FEATURE_COLUMNS = [
+        # Time features
+        'hour', 'minute', 'day_of_week', 'day_of_month', 'month', 'is_weekend',
+        # Lag features
+        'cpu_lag_1', 'cpu_lag_5', 'cpu_lag_10', 'cpu_lag_30',
+        'req_lag_1', 'req_lag_5',
+        # Rolling features
+        'cpu_rolling_mean_5', 'cpu_rolling_mean_15', 'cpu_rolling_mean_30',
+        'cpu_rolling_std_5', 'cpu_rolling_std_15', 'cpu_rolling_max_15',
+        'req_rolling_mean_5',
+        # Rate of change features (key for ramp-up detection)
+        'cpu_delta_5', 'cpu_delta_15',
+        # Memory usage (independent signal)
+        'memory_usage',
+    ]
 
-    print(f"\n✅ Processed data saved → data/processed_logs.csv")
-    print(f"\nNext step: python train_models.py")
+    print(f"\nFeatures used for training ({len(FEATURE_COLUMNS)} total):")
+    for f in FEATURE_COLUMNS:
+        print(f"  - {f}")
+
+    output_path = 'data/processed_logs.csv'
+    df.to_csv(output_path, index=False)
+
+    spike_rate = df['spike_in_5min'].mean()
+    print(f"\n✓ Processed {len(df):,} rows")
+    print(f"  Spike rate (target=1): {100*spike_rate:.1f}%")
+    print(f"  Non-spike rate (target=0): {100*(1-spike_rate):.1f}%")
+    print(f"\n✓ Saved → {output_path}")
+
+
+if __name__ == '__main__':
+    main()
